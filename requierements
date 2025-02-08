@@ -1,0 +1,8 @@
+requests==2.32.3
+pyrebase4==4.8.0
+base58
+solders
+requests-toolbelt==0.9.1
+gcloud==0.18.3
+oauth2client==4.1.3
+pycryptodome==3.21.0
