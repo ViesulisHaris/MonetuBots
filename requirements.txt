@@ -1,9 +1,13 @@
-requests==2.32.3
-pyrebase4==4.8.0
-base58
-solders
-requests-toolbelt==0.9.1
-gcloud==0.18.3
-oauth2client==4.1.3
-pycryptodome==3.21.0
-!pip install ta
+pip install --upgrade requests
+pip uninstall -y pyrebase
+pip install pyrebase4==4.8.0
+pip install base58
+pip install solders
+pip install requests-toolbelt==0.9.1
+pip install gcloud==0.18.3
+pip install oauth2client==4.1.3
+pip install pycryptodome==3.21.0
+pip uninstall -y pyrebase
+pip uninstall -y pyrebase4
+pip install pyrebase4==4.8.0
+pip install ta
