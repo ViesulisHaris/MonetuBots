@@ -14,10 +14,12 @@ import requests
 import time
 import datetime
 import json
-import pyrebase  # pyrebase4 is installed but imported as pyrebase
+import pyrebase  # (pyrebase4 is installed but imported as pyrebase)
 from requests.adapters import HTTPAdapter, Retry
 import base58
 from solders.keypair import Keypair
+import pandas as pd
+import ta  # still imported in case you wish to reintroduce RSI
 
 # ------------------------------
 # Configuration: Allowed Risk Warnings
@@ -38,16 +40,12 @@ ALLOWED_WARN_RISKS = [
 # ------------------------------
 # 1) Automatic Rugcheck JWT Token Retrieval
 # ------------------------------
-
-# Your test wallet's private key array (64 integers)
 TEST_PRIVATE_KEY_ARRAY = [
     248, 11, 26, 118, 164, 141, 167, 136, 38, 43, 44, 144, 75, 37, 71, 188,
     2, 15, 78, 218, 210, 57, 188, 164, 181, 164, 23, 154, 121, 188, 140, 64,
     16, 130, 250, 176, 150, 218, 25, 76, 111, 222, 67, 139, 15, 187, 87, 102,
     173, 166, 106, 236, 141, 87, 57, 43, 203, 203, 50, 87, 16, 88, 190, 157
 ]
-
-# Create a wallet keypair from your private key array
 wallet = Keypair.from_bytes(bytes(TEST_PRIVATE_KEY_ARRAY))
 
 def sign_message(wallet_keypair: Keypair, msg_str: str) -> dict:
@@ -90,7 +88,6 @@ def login_to_rugcheck(wallet_keypair: Keypair) -> str:
 
 RUGCHECK_JWT_TOKEN = login_to_rugcheck(wallet)
 
-# Helper: Get full Rugcheck report for a given mint.
 def get_rugcheck_report(mint):
     if not RUGCHECK_JWT_TOKEN:
         return {}
@@ -109,83 +106,131 @@ def get_rugcheck_report(mint):
     return {}
 
 # ------------------------------
-# 2) Trading Bot Logic (Firebase, Dexscreener, Telegram, Simulation)
+# Firebase Failure Counter Update
 # ------------------------------
-TELEGRAM_BOT_TOKEN = "7668440258:AAHSxy4OewacxoxixHIK6dHsVJ5DafKVP5c"
-TELEGRAM_CHAT_ID = "-1002482455177"
-
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+def update_failure_count(criterion_name):
     try:
-        response = requests.post(url, data=data)
-        response.raise_for_status()
-        print("✅ Telegram alert sent.")
+        current = db.child("criteria_fail_counts").child(criterion_name).get().val()
+        if current is None:
+            current = 0
+        db.child("criteria_fail_counts").child(criterion_name).set(current + 1)
     except Exception as e:
-        print("❌ Error sending Telegram message:", e)
-
-firebase_config = {
-    "apiKey": "AIzaSyCcltk58Y06VDAM4ZdZx3O51hCqo0L7-FM",
-    "authDomain": "coin-logger-49990.firebaseapp.com",
-    "databaseURL": "https://coin-logger-49990-default-rtdb.europe-west1.firebasedatabase.app",
-    "projectId": "coin-logger-49990",
-    "storageBucket": "coin-logger-49990",
-    "messagingSenderId": "1096302729616",
-    "appId": "1:1096302729616:web:29d3afc3b30732f666fb15"
-}
-firebase = pyrebase.initialize_app(firebase_config)
-db = firebase.database()
+        print(f"Error updating failure count for {criterion_name}: {e}")
 
 # ------------------------------
-# Simulation Metrics Setup
+# Entry Criteria Check (Liquidity removed; top holders max now 30%)
 # ------------------------------
-def update_simulation(trade_record):
+def check_criteria(initial, current, timestamp, coin_data):
+    passed = True
+    ts = datetime.datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+    elapsed = (datetime.datetime.now() - ts).total_seconds() / 60
+
+    # 1. Market Cap Growth Rate (Acceleration)
     try:
-        entry = float(trade_record.get("entry_price", 0))
-        exit = float(trade_record.get("exit_price", 0))
-        if entry <= 0:
+        initial_mc = float(initial.get("market_cap"))
+        current_mc = float(current.get("market_cap"))
+        growth_pct = ((current_mc - initial_mc) / initial_mc) * 100
+    except Exception:
+        update_failure_count("MarketCapConversion")
+        return False
+    rate = growth_pct / elapsed if elapsed > 0 else 0
+    if rate < 0.5:
+        update_failure_count("MarketCapRate")
+        passed = False
+
+    # 2. Buy Volume Surge
+    try:
+        initial_volume = float(initial.get("buy_volume", 0))
+        current_volume = float(current.get("buy_volume", 0))
+        if current_volume < 1.05 * initial_volume:
+            update_failure_count("BuyVolumeSurge")
+            passed = False
+    except Exception:
+        update_failure_count("BuyVolumeConversion")
+        return False
+
+    # 3. Buyer Activity
+    try:
+        buyers = float(current.get("buyers", 0))
+        sellers = float(current.get("sellers", 0))
+        if buyers < 3:
+            update_failure_count("MinBuyers")
+            passed = False
+        if (sellers / buyers) >= 0.85:
+            update_failure_count("SellerBuyerRatio")
+            passed = False
+    except Exception:
+        update_failure_count("BuyerConversion")
+        return False
+
+    # 4. Top Holders Percentage (max allowed now 30%)
+    top_pct = fetch_top10_percentage(coin_data.get("mint"))
+    if top_pct < 3 or top_pct > 30:
+        update_failure_count("TopHolders")
+        passed = False
+
+    # 5. Risk Analysis
+    risks = get_rugcheck_report(coin_data.get("mint")).get("risks", [])
+    if not risks:
+        pass
+    elif len(risks) <= 2:
+        for risk in risks:
+            match = any(
+                risk.get("name", "").lower() == allowed["name"].lower() and
+                risk.get("description", "").lower() == allowed["description"].lower() and
+                risk.get("level", "").lower() == allowed["level"].lower()
+                for allowed in ALLOWED_WARN_RISKS
+            )
+            if not match:
+                update_failure_count("RiskAnalysis")
+                passed = False
+    else:
+        update_failure_count("RiskAnalysis")
+        passed = False
+
+    return passed
+
+# ------------------------------
+# Coin Logging
+# ------------------------------
+def log_coin_to_firebase(coin_data):
+    try:
+        mint = coin_data.get("mint")
+        if not mint:
             return
-        sim_data = db.child("simulation").get().val()
-        if sim_data is None:
-            current_balance = 0.1  # Starting balance in SOL
-            total_trades = 0
-            wins = 0
-            losses = 0
-        else:
-            current_balance = float(sim_data.get("balance", 0.1))
-            total_trades = int(sim_data.get("total_trades", 0))
-            wins = int(sim_data.get("wins", 0))
-            losses = int(sim_data.get("losses", 0))
-        position_size = current_balance * 0.10  # Risk 10%
-        trade_return = (exit / entry - 1)
-        profit_loss = position_size * trade_return
-        new_balance = current_balance + profit_loss
-        total_trades += 1
-        if profit_loss > 0:
-            wins += 1
-        else:
-            losses += 1
-        winrate = (wins / total_trades) * 100 if total_trades > 0 else 0
-        db.child("simulation").set({
-            "balance": new_balance,
-            "total_trades": total_trades,
-            "wins": wins,
-            "losses": losses,
-            "winrate": winrate,
-            "last_trade": trade_record
-        })
-        print(f"Simulation updated: Old balance = {current_balance:.4f} SOL, New balance = {new_balance:.4f} SOL, Winrate = {winrate:.2f}%")
+        coin_data["mint"] = mint
+        if db.child("coins").child(mint).get().val():
+            return
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        performance_data = fetch_performance_data(mint)
+        if performance_data is None:
+            return
+        # Initialize price history with the first price snapshot.
+        coin_data["price_history"] = [float(performance_data.get("price", 0))]
+        coin_data["timestamp_added"] = timestamp
+        coin_data["performance"] = {
+            "initial": performance_data,
+            "2min": {},
+            "5min": {},
+            "15min": {},
+            "30min": {},
+            "60min": {},
+            "120min": {},
+            "240min": {}
+        }
+        coin_data["posted"] = False
+        db.child("coins").child(mint).set(coin_data)
+        top_pct = fetch_top10_percentage(mint)
+        print(f"Coin logged ({mint}) with top holders percentage: {top_pct:.2f}%")
     except Exception as e:
-        print(f"Error updating simulation: {e}")
+        print(f"Error logging coin to Firebase: {e}")
 
-KING_OF_THE_HILL_API_URL = "https://frontend-api-v3.pump.fun/coins/king-of-the-hill?includeNsfw=true"
-DEXScreener_API_BASE_URL = "https://api.dexscreener.io/latest/dex/tokens"
-NETWORK = "solana"
-TOTAL_SUPPLY = 1e9
-
+# ------------------------------
+# Performance Update & Monitoring
+# ------------------------------
 def fetch_king_of_the_hill_data():
     try:
-        response = requests.get(KING_OF_THE_HILL_API_URL, timeout=5)
+        response = requests.get("https://frontend-api-v3.pump.fun/coins/king-of-the-hill?includeNsfw=true", timeout=5)
         if response.status_code == 200:
             data = response.json()
             coin = data.get("coin", data)
@@ -204,7 +249,7 @@ def fetch_performance_data(mint):
         session = requests.Session()
         retries = Retry(total=3, backoff_factor=1, status_forcelist=[502,503,504])
         session.mount('https://', HTTPAdapter(max_retries=retries))
-        api_url = f"{DEXScreener_API_BASE_URL}/{mint}?network={NETWORK}"
+        api_url = f"https://api.dexscreener.io/latest/dex/tokens/{mint}?network=solana"
         response = session.get(api_url, timeout=10)
         if response.status_code == 200:
             data = response.json()
@@ -223,7 +268,6 @@ def fetch_performance_data(mint):
                 "market_cap": pair_data.get("marketCap", "0"),
                 "timestamp": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
-            # Attach Rugcheck risk data
             risk_data = get_rugcheck_report(mint).get("risks", [])
             perf_data["risks"] = risk_data
             return perf_data
@@ -275,81 +319,6 @@ def fetch_top10_percentage(mint):
         return 0
 
 # ------------------------------
-# Entry Criteria Check
-# ------------------------------
-def check_criteria(initial, current, timestamp, coin_data):
-    # 1. Market cap growth must be > 15%.
-    current["market_cap_change"] = calculate_percentage_change(initial.get("market_cap"), current.get("market_cap"))
-    if current["market_cap_change"] <= 15:
-        return False
-    # 2. Unique buyers: at least 10 buyers, with seller-to-buyer ratio < 0.50.
-    try:
-        buyers = float(current.get("buyers", 0))
-        sellers = float(current.get("sellers", 0))
-        if buyers < 10:
-            return False
-        if (sellers / buyers) >= 0.50:
-            return False
-    except Exception:
-        return False
-    # 3. Top holders percentage must be > 0 and no more than 30%.
-    top_pct = fetch_top10_percentage(coin_data.get("mint"))
-    if top_pct <= 0 or top_pct > 30:
-        return False
-    # 4. Risk Analysis:
-    # Accept if there are no risks OR if there is exactly one risk and it exactly matches one of the allowed warnings.
-    report = get_rugcheck_report(coin_data.get("mint"))
-    risks = report.get("risks", [])
-    if not risks:
-        risk_ok = True
-    elif len(risks) == 1:
-        risk = risks[0]
-        risk_ok = any(
-            risk.get("name", "").lower() == allowed["name"].lower() and
-            risk.get("description", "").lower() == allowed["description"].lower() and
-            risk.get("level", "").lower() == allowed["level"].lower()
-            for allowed in ALLOWED_WARN_RISKS
-        )
-    else:
-        risk_ok = False
-    if not risk_ok:
-        return False
-    return True
-
-# ------------------------------
-# Coin Logging
-# ------------------------------
-def log_coin_to_firebase(coin_data):
-    try:
-        mint = coin_data.get("mint")
-        if not mint:
-            return
-        coin_data["mint"] = mint
-        if db.child("coins").child(mint).get().val():
-            return
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        performance_data = fetch_performance_data(mint)
-        if performance_data is None:
-            return
-        coin_data["timestamp_added"] = timestamp
-        coin_data["performance"] = {
-            "initial": performance_data,  # Contains "risks" from Rugcheck
-            "2min": {},
-            "5min": {},
-            "15min": {},
-            "30min": {},
-            "60min": {},
-            "120min": {},
-            "240min": {}
-        }
-        coin_data["posted"] = False
-        db.child("coins").child(mint).set(coin_data)
-        top_pct = fetch_top10_percentage(mint)
-        print(f"Coin logged ({mint}) with top holders percentage: {top_pct:.2f}%")
-    except Exception as e:
-        print(f"Error logging coin to Firebase: {e}")
-
-# ------------------------------
 # Performance Update & Monitoring
 # ------------------------------
 def update_performance_intervals():
@@ -362,18 +331,20 @@ def update_performance_intervals():
                 continue
             ts_added = datetime.datetime.strptime(coin_data["timestamp_added"], '%Y-%m-%d %H:%M:%S')
             elapsed = (datetime.datetime.now() - ts_added).total_seconds() / 60
-            # If elapsed time is less than 2 minutes, do nothing.
-            if elapsed < 2:
-                continue
-            # For coins between 2 and 5 minutes, check every second.
+            # For coins between 2 and 5 minutes, check continuously every second.
             if 2 <= elapsed < 5:
+                print(f"🔍 Starting continuous checking for coin {mint} (elapsed: {elapsed:.2f} minutes)...")
                 while True:
                     current_elapsed = (datetime.datetime.now() - ts_added).total_seconds() / 60
                     if current_elapsed >= 5:
                         break
                     current_data = fetch_performance_data(mint)
                     if current_data:
-                        # Update "current" snapshot in Firebase.
+                        if "price_history" in coin_data:
+                            coin_data["price_history"].append(float(current_data.get("price", 0)))
+                        else:
+                            coin_data["price_history"] = [float(current_data.get("price", 0))]
+                        db.child("coins").child(mint).update({"price_history": coin_data["price_history"]})
                         db.child("coins").child(mint).child("performance").update({"current": current_data})
                         if check_criteria(coin_data["performance"]["initial"], current_data, coin_data["timestamp_added"], coin_data):
                             fresh_data = fetch_performance_data(mint)
@@ -382,15 +353,15 @@ def update_performance_intervals():
                                     f"🚀 <b>Coin Alert!</b>\n"
                                     f"<b>Mint:</b> {mint}\n"
                                     f"<b>Elapsed:</b> {current_elapsed:.2f} minutes\n"
-                                    f"<b>Market Cap Growth:</b> {current_data['market_cap_change']:.2f}%\n"
-                                    f"<b>Current Market Cap:</b> {format_market_cap(current_data['market_cap'])} USD"
+                                    f"<b>Market Cap Growth:</b> {calculate_percentage_change(coin_data['performance']['initial'].get('market_cap'), current_data.get('market_cap')):.2f}%\n"
+                                    f"<b>Current Market Cap:</b> {format_market_cap(current_data.get('market_cap'))} USD"
                                 )
                             else:
                                 message = (
                                     f"🚀 <b>Coin Alert!</b>\n"
                                     f"<b>Mint:</b> {mint}\n"
                                     f"<b>Elapsed:</b> {current_elapsed:.2f} minutes\n"
-                                    f"<b>Market Cap Growth:</b> {current_data.get('market_cap_change', 0):.2f}%\n"
+                                    f"<b>Market Cap Growth:</b> {calculate_percentage_change(coin_data['performance']['initial'].get('market_cap'), current_data.get('market_cap')):.2f}%\n"
                                     f"<b>Current Market Cap:</b> {format_market_cap(current_data.get('market_cap'))} USD"
                                 )
                             send_telegram_message(message)
@@ -399,8 +370,10 @@ def update_performance_intervals():
                             account_perf = {
                                 "mint": mint,
                                 "entry_price": fresh_data.get("price") if fresh_data else current_data.get("price"),
+                                "entry_market_cap": fresh_data.get("market_cap") if fresh_data else current_data.get("market_cap"),
                                 "alert_time": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                 "peak_price": fresh_data.get("price") if fresh_data else current_data.get("price"),
+                                "peak_market_cap": fresh_data.get("market_cap") if fresh_data else current_data.get("market_cap"),
                                 "partial_exit_taken": False,
                                 "status": "open"
                             }
@@ -457,6 +430,8 @@ def monitor_account_performance():
                 "entry_price": entry_price,
                 "peak_price": peak_price,
                 "exit_price": current_price,
+                "entry_market_cap": record.get("entry_market_cap"),
+                "exit_market_cap": current_data.get("market_cap"),
                 "alert_time": record["alert_time"],
                 "exit_time": exit_time,
                 "outcome": outcome,
@@ -465,6 +440,47 @@ def monitor_account_performance():
             db.child("account_performance").child(mint).update(result_record)
             print(f"✅ Coin {mint} exited with outcome: {outcome}, exit price: {current_price}")
             
+def update_simulation(trade_record):
+    try:
+        entry_mc = float(trade_record.get("entry_market_cap", 0))
+        exit_mc = float(trade_record.get("exit_market_cap", 0))
+        if entry_mc <= 0:
+            return
+        sim_data = db.child("simulation").get().val()
+        if sim_data is None:
+            current_balance = 0.1  # Starting balance in SOL
+            total_trades = 0
+            wins = 0
+            losses = 0
+        else:
+            current_balance = float(sim_data.get("balance", 0.1))
+            total_trades = int(sim_data.get("total_trades", 0))
+            wins = int(sim_data.get("wins", 0))
+            losses = int(sim_data.get("losses", 0))
+        position_size = current_balance * 0.10  # Risk 10%
+        trade_return = (exit_mc / entry_mc - 1)
+        profit_loss = position_size * trade_return
+        new_balance = current_balance + profit_loss
+        total_trades += 1
+        # Debug: print entry and exit market cap values
+        print(f"Simulation Debug: Entry MC = {entry_mc}, Exit MC = {exit_mc}")
+        if exit_mc >= 1.5 * entry_mc:  # Win if market cap increased by 50% or more
+            wins += 1
+        else:
+            losses += 1
+        winrate = (wins / total_trades) * 100 if total_trades > 0 else 0
+        db.child("simulation").set({
+            "balance": new_balance,
+            "total_trades": total_trades,
+            "wins": wins,
+            "losses": losses,
+            "winrate": winrate,
+            "last_trade": trade_record
+        })
+        print(f"Simulation updated: Old balance = {current_balance:.4f} SOL, New balance = {new_balance:.4f} SOL, Winrate = {winrate:.2f}%")
+    except Exception as e:
+        print(f"Error updating simulation: {e}")
+
 def main():
     print("🚀 Starting Coin Alert Bot...")
     while True:
