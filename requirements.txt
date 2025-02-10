@@ -11,3 +11,4 @@ pip uninstall -y pyrebase
 pip uninstall -y pyrebase4
 pip install pyrebase4==4.8.0
 pip install ta
+pip install requests
